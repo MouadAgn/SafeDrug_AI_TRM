@@ -1,0 +1,7 @@
+tensorflow
+numpy
+datasets
+pandas
+streamlit
+matplotlib
+protobuf==3.20.3

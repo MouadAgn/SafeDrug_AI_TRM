@@ -1,186 +1,262 @@
 import streamlit as st
-import numpy as np
 import tensorflow as tf
-import sys
-import os
-import streamlit.components.v1 as components
-import pubchempy as pcp  # <--- LA NOUVELLE LIBRAIRIE MAGIQUE
+from tensorflow import keras
+from tensorflow.keras import layers
+import numpy as np
+import pubchempy as pcp
+from rdkit import Chem
+from rdkit.Chem import Draw
+import random
 
-# --- 1. SETUP ---
-current_dir = os.path.dirname(os.path.abspath(__file__))
-src_dir = os.path.join(current_dir, '..', 'src')
-sys.path.append(src_dir)
+# ==============================================================================
+# 1. CONSTANTES & CLASSES (Architecture du modèle RNA)
+# ==============================================================================
 
-from model import TRM_Official
-from data_loader import RNA_MAP, STRUCT_MAP, INV_STRUCT_MAP, MAX_LEN
+MAX_LEN = 150
+D_MODEL = 32
+N_REC = 1
+N_SUP = 3 # Attention à bien garder la valeur utilisée lors de l'entraînement
+SEQ_MAP = {'A': 1, 'C': 2, 'G': 3, 'U': 4, 'T': 4, 'N': 0}
+REV_STRUCT_MAP = {0: '', 1: '.', 2: '(', 3: ')'}
 
-# --- CONFIG ---
-D_MODEL = 64
-N_RECURSION = 2
-T_LOOPS = 2
-N_REFINE = 3
+class TinyBlock(layers.Layer):
+    def __init__(self, d, **kwargs):
+        super().__init__(**kwargs)
+        self.ln = layers.LayerNormalization()
+        self.fc1 = layers.Dense(4 * d, activation="gelu")
+        self.fc2 = layers.Dense(d)
+        self.d = d
 
-st.set_page_config(page_title="Project Origami", page_icon="🧬", layout="wide")
+    def call(self, u):
+        h = self.ln(u)
+        h = self.fc1(h)
+        h = self.fc2(h)
+        return u + h
+        
+    def get_config(self):
+        config = super().get_config()
+        config.update({"d": self.d})
+        return config
 
-# Style CSS
-st.markdown("""
-<style>
-    .stTextArea textarea { font-family: 'Courier New', monospace; }
-    .success-box { padding: 10px; background-color: #d4edda; color: #155724; border-radius: 5px; }
-    .chem-formula { font-family: monospace; font-weight: bold; color: #e83e8c; }
-</style>
-""", unsafe_allow_html=True)
+class RNATRM(keras.Model):
+    def __init__(self, input_vocab=5, output_vocab=4, d=64, max_len=150, n_rec=2, T=3, Nsup=4, **kwargs):
+        super().__init__(**kwargs)
+        self.d = d
+        self.n_rec = n_rec
+        self.T = T
+        self.Nsup = Nsup
+        self.input_vocab = input_vocab
+        self.output_vocab = output_vocab
+        self.max_len = max_len
 
-st.title("🧬 Project Origami: AI Drug Discovery")
+        self.emb = layers.Embedding(input_vocab, d)
+        self.pos = self.add_weight(shape=(1, max_len, d), initializer="random_normal", trainable=True)
+        self.y0 = self.add_weight(shape=(1, max_len, d), initializer="zeros", trainable=True)
+        self.z0 = self.add_weight(shape=(1, max_len, d), initializer="zeros", trainable=True)
+        self.block1 = TinyBlock(d)
+        self.block2 = TinyBlock(d)
+        self.to_structure = layers.Dense(output_vocab) 
+        self.halt_head = layers.Dense(1)
 
-# --- CHARGEMENT MODELE ---
-@st.cache_resource
-def load_model():
-    model = TRM_Official(len(RNA_MAP), len(STRUCT_MAP), d=D_MODEL, max_len=MAX_LEN, n=N_RECURSION, T=T_LOOPS)
-    # Build dummy
-    dummy_x = tf.zeros((1, MAX_LEN), dtype=tf.int32)
-    dummy_y = tf.zeros((1, MAX_LEN), dtype=tf.int32)
-    dummy_z = tf.zeros((1, MAX_LEN, D_MODEL), dtype=tf.float32)
-    model([model.emb_x(dummy_x), model.emb_y(dummy_y), dummy_z])
+    def tiny_net(self, u):
+        u = self.block1(u)
+        u = self.block2(u)
+        return u
+
+    def update_z(self, x, y, z): return self.tiny_net(x + y + z)
+    def update_y(self, y, z): return self.tiny_net(y + z)
+
+    def call(self, x_tokens, y_true=None, training=False):
+        B = tf.shape(x_tokens)[0]
+        L = tf.shape(x_tokens)[1]
+        x = self.emb(x_tokens) + self.pos[:, :L, :]
+        y = tf.tile(self.y0[:, :L, :], [B, 1, 1])
+        z = tf.tile(self.z0[:, :L, :], [B, 1, 1])
+
+        for step in range(self.Nsup):
+            for t in range(self.T):
+                if t < self.T - 1:
+                    for _ in range(self.n_rec):
+                        z = tf.stop_gradient(self.update_z(x, y, z))
+                    y = tf.stop_gradient(self.update_y(y, z))
+                else:
+                    for _ in range(self.n_rec):
+                        z = self.update_z(x, y, z)
+                    y = self.update_y(y, z)
+            logits = self.to_structure(y)
+            halt_p = tf.sigmoid(tf.reduce_mean(self.halt_head(y), axis=1))
+            y = tf.stop_gradient(y)
+            z = tf.stop_gradient(z)
+        return logits, halt_p
     
-    weight_path = os.path.join(current_dir, '..', 'saved_models', 'trm_paper_version.weights.h5')
-    if os.path.exists(weight_path):
-        model.load_weights(weight_path)
-        return model, True
-    return model, False
+    def get_config(self):
+        config = super().get_config()
+        config.update({"input_vocab": self.input_vocab, "output_vocab": self.output_vocab, "d": self.d, "max_len": self.max_len, "n_rec": self.n_rec, "T": self.T, "Nsup": self.Nsup})
+        return config
 
-model, is_loaded = load_model()
+# ==============================================================================
+# 2. FONCTIONS UTILITAIRES (RNA + DRUG)
+# ==============================================================================
 
-if is_loaded:
-    st.sidebar.success("✅ IA RNA-Folding : Active")
+def preprocess_sequence(seq, max_len=150):
+    seq = seq.strip().upper()
+    x_seq = [SEQ_MAP.get(c, 0) for c in seq]
+    if len(x_seq) > max_len:
+        x_seq = x_seq[:max_len]
+    else:
+        x_seq = x_seq + [0] * (max_len - len(x_seq))
+    return np.array([x_seq]), len(seq)
 
-# --- NOUVEAU : RÉCUPÉRER LA VRAIE MOLÉCULE ---
-def get_molecule_from_name(name):
+@st.cache_resource
+def load_rna_model(weights_path):
+    model = RNATRM(input_vocab=5, output_vocab=4, d=D_MODEL, max_len=MAX_LEN, n_rec=N_REC, T=3, Nsup=N_SUP)
+    dummy_x = tf.zeros((1, MAX_LEN))
+    model(dummy_x)
     try:
-        # On cherche dans la base de données mondiale PubChem
+        model.load_weights(weights_path)
+    except ValueError:
+        try:
+            model.load_weights(weights_path, by_name=True, skip_mismatch=True)
+        except Exception as e:
+            return None
+    except Exception as e:
+        return None
+    return model
+
+# --- NOUVEAU : Fonctions Médicaments ---
+
+def get_drug_from_pubchem(name):
+    """Récupère le SMILES et l'image d'un médicament via PubChem."""
+    try:
         compounds = pcp.get_compounds(name, 'name')
         if compounds:
             c = compounds[0]
-            return {
-                "smiles": c.canonical_smiles, # La formule brute
-                "formula": c.molecular_formula, # Ex: C9H8O4
-                "weight": c.molecular_weight,
-                "cid": c.cid
-            }
-    except:
-        return None
-    return None
+            smiles = c.isomeric_smiles
+            mol = Chem.MolFromSmiles(smiles)
+            img = Draw.MolToImage(mol, size=(300, 150))
+            return c.cid, smiles, img
+    except Exception as e:
+        return None, None, None
+    return None, None, None
 
-# --- VISUALISATION ---
-def render_rna_plot(sequence, structure):
-    html_code = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <script type="text/javascript" src="https://unpkg.com/tntvis@0.3.1/dist/tnt.utils.min.js"></script>
-        <script type="text/javascript" src="https://unpkg.com/fornac@0.3.1/dist/fornac.js"></script>
-        <link rel="stylesheet" href="https://unpkg.com/fornac@0.3.1/dist/fornac.css" />
-        <style> #rna_ss {{ height: 400px; width: 100%; }} </style>
-    </head>
-    <body>
-        <div id="rna_ss"></div>
-        <script>
-            var container = new fornac.FornaContainer("#rna_ss", 
-                {{'sequence': '{sequence}', 'structure': '{structure}'}});
-            container.addOptions({{'structureOptions': {{'avoidOthers': true}}}});
-        </script>
-    </body>
-    </html>
+def predict_efficacy_dummy(rna_seq, drug_smiles):
     """
-    components.html(html_code, height=450)
-
-# --- PREDICTION ---
-def predict(seq):
-    clean_seq = seq.replace("\n", "").strip().upper()
-    enc = [RNA_MAP.get(c, 5) for c in clean_seq]
-    enc = enc[:MAX_LEN] + [0]*(MAX_LEN-len(enc))
-    x = np.array([enc], dtype=np.int32)
-    x_emb = model.emb_x(x) + model.pos_emb[:, :MAX_LEN, :]
-    y = tf.zeros((1, MAX_LEN), dtype=tf.int32)
-    z = tf.zeros((1, MAX_LEN, D_MODEL), dtype=tf.float32)
+    SIMULATION : Calcule une efficacité basée sur des heuristiques simples
+    car le modèle RNA actuel ne prend pas de médicament en entrée.
+    """
+    # On utilise un hash pour que le résultat soit constant pour une même paire (RNA, Drug)
+    seed_val = hash(rna_seq + drug_smiles)
+    random.seed(seed_val)
     
-    progress = st.progress(0)
-    for i in range(N_REFINE):
-        logits, _, _, z_new = model([x_emb, model.emb_y(y), z])
-        y = tf.argmax(logits, axis=-1, output_type=tf.int32)
-        z = z_new
-        progress.progress((i+1)/N_REFINE)
+    # Simulation d'affinité entre 0% et 100%
+    base_score = random.uniform(20, 95)
     
-    struct = ""
-    indices = y.numpy()[0]
-    real_len = min(len(clean_seq), MAX_LEN)
-    for idx in indices[:real_len]:
-        struct += INV_STRUCT_MAP.get(idx, ".")
-    return struct, clean_seq[:real_len]
-
-# --- INTERFACE ---
-col1, col2 = st.columns([1, 2])
-
-with col1:
-    st.subheader("1. Cible (Maladie)")
-    sequence_input = st.text_area("Séquence ARN :", 
-        "GCGGAUUUAGCUCAGDDGGGAGAGCGCCAGACUGAAYAAAUCUGGAGGUCCUGUGUUCGAUCCACAGAAUUCGC", height=150)
+    # Petit bonus si l'ARN est riche en GC (plus stable)
+    gc_content = (rna_seq.count('G') + rna_seq.count('C')) / len(rna_seq)
+    final_score = base_score + (gc_content * 10)
     
-    st.markdown("---")
-    st.subheader("2. Médicament (Molécule)")
-    drug_name = st.text_input("Nom du médicament :", "Aspirin")
-    
-    if st.button("Lancer l'Analyse"):
-        if is_loaded:
-            # 1. Analyse ARN
-            with st.spinner("Repliement de l'ARN..."):
-                struct_pred, seq_final = predict(sequence_input)
-                st.session_state['rna_result'] = (seq_final, struct_pred)
-            
-            # 2. Analyse Médicament (Récupération des vraies données)
-            with st.spinner(f"Recherche chimique de '{drug_name}'..."):
-                mol_data = get_molecule_from_name(drug_name)
-                st.session_state['mol_data'] = mol_data
-                st.session_state['drug_name'] = drug_name
+    return min(99.9, max(0.1, final_score))
 
-with col2:
-    if 'rna_result' in st.session_state:
-        seq, struct = st.session_state['rna_result']
+# ==============================================================================
+# 3. INTERFACE UTILISATEUR
+# ==============================================================================
+
+st.set_page_config(page_title="SafeDrug AI: RNA & Interaction", page_icon="💊", layout="wide")
+
+st.title("💊 SafeDrug AI : RNA & Drug Interaction")
+st.markdown("Analyse de structure d'ARN et estimation d'efficacité thérapeutique.")
+
+# Sidebar : Chargement Modèle
+st.sidebar.header("1. Cerveau IA")
+weights_file = st.sidebar.file_uploader("Charger les poids (.h5)", type=["h5", "keras"])
+
+if weights_file:
+    with open("temp_weights.h5", "wb") as f:
+        f.write(weights_file.getbuffer())
+    
+    model = load_rna_model("temp_weights.h5")
+    
+    if model:
+        st.sidebar.success("Modèle RNA chargé !")
         
-        # Onglets pour séparer les vues
-        tab1, tab2 = st.tabs(["🧬 Visualisation Cible", "💊 Analyse Médicament"])
+        # --- Colonne Gauche : Séquence RNA ---
+        col1, col2 = st.columns(2)
         
-        with tab1:
-            render_rna_plot(seq, struct)
-            st.caption(f"Structure 2D Prédite : {struct}")
-
-        with tab2:
-            mol = st.session_state.get('mol_data')
-            name = st.session_state.get('drug_name')
+        with col1:
+            st.subheader("🧬 Séquence ARN")
+            seq_input = st.text_area("Entrez la séquence cible", 
+                                    value="GCGGAUUUAGCUCAGUUGGGAGAGCGCCAGACUGAAGAUCUGGAGGUCCUGUGUUCGAUCCACAGAAUUCGCAC",
+                                    height=150)
             
-            if mol:
-                st.success(f"Molécule identifiée : {name}")
-                st.markdown(f"**Formule Chimique :** `{mol['formula']}`")
-                st.markdown(f"**Poids Moléculaire :** {mol['weight']} g/mol")
-                st.markdown("**Code SMILES (Lu par l'IA) :**")
-                st.code(mol['smiles'], language="text")
+            x_val, original_len = preprocess_sequence(seq_input, MAX_LEN)
+            
+            # Prédiction Structure
+            logits, _ = model(x_val, training=False)
+            preds = np.argmax(logits, axis=-1)[0]
+            limit = min(original_len, MAX_LEN)
+            pred_str = "".join([REV_STRUCT_MAP.get(t, '.') for t in preds])[:limit]
+            
+            st.info(f"Structure prédite (Dot-Bracket) :\n{pred_str}")
+
+        # --- Colonne Droite : Médicament ---
+        with col2:
+            st.subheader("💊 Médicament Candidat")
+            drug_name = st.text_input("Nom du médicament (ex: Aspirin, Paclitaxel)", value="Caffeine")
+            
+            if drug_name:
+                with st.spinner(f"Recherche de '{drug_name}' sur PubChem..."):
+                    cid, smiles, img = get_drug_from_pubchem(drug_name)
                 
-                # Image 2D de la molécule (via PubChem Widget)
-                st.markdown(f"![Structure 2D](https://pubchem.ncbi.nlm.nih.gov/image/imagefly.cgi?cid={mol['cid']}&width=300&height=300)")
-                
-                st.divider()
-                st.subheader("Résultat de l'interaction")
-                # ICI : Pour l'instant c'est simulé car on n'a pas entraîné le modèle d'interaction
-                # Mais au moins, on a les VRAIES données d'entrée
-                
-                # Simulation intelligente : Si la molécule est petite, elle passe mieux
-                score = 0.85 if mol['weight'] < 500 else 0.40
-                
-                st.metric("Score d'Affinité (Binding)", f"{score*100:.1f}%")
-                if score > 0.7:
-                    st.write("✅ **Candidat Prometteur** : Cette molécule est assez petite pour s'insérer dans les boucles de l'ARN.")
+                if cid:
+                    st.image(img, caption=f"CID: {cid}")
+                    st.caption(f"**SMILES:** `{smiles}`")
                 else:
-                    st.write("⚠️ **Risque d'échec** : Molécule probablement trop volumineuse.")
+                    st.error("Médicament non trouvé sur PubChem.")
+                    smiles = None
+
+        st.divider()
+
+        # --- Section : Interaction & Efficacité ---
+        if st.button("Lancer l'analyse d'interaction", type="primary"):
+            if smiles and seq_input:
+                st.subheader("📊 Résultats de l'analyse")
                 
+                # 1. Visualisation ARN colorée
+                html_view = "<div style='font-family: monospace; font-size: 1.2em; letter-spacing: 2px; margin-bottom: 20px;'>"
+                for base, struc in zip(seq_input[:limit], pred_str):
+                    color = "black"
+                    if struc == '(': color = "#1E88E5" # Bleu
+                    elif struc == ')': color = "#D32F2F" # Rouge
+                    elif struc == '.': color = "#9E9E9E" # Gris
+                    html_view += f"<span style='color: {color}; font-weight:bold;' title='{struc}'>{base}</span>"
+                html_view += "</div>"
+                st.markdown("#### Repliement de la cible :")
+                st.markdown(html_view, unsafe_allow_html=True)
+                
+                # 2. Score d'efficacité (SIMULÉ)
+                efficacy = predict_efficacy_dummy(seq_input, smiles)
+                
+                # Jauge d'efficacité
+                col_res1, col_res2 = st.columns([1, 3])
+                with col_res1:
+                    st.metric(label="Efficacité Estimée", value=f"{efficacy:.1f} %")
+                with col_res2:
+                    st.progress(efficacy / 100)
+                    if efficacy > 75:
+                        st.success("Interaction forte détectée : Candidat prometteur.")
+                    elif efficacy > 40:
+                        st.warning("Interaction modérée : Optimisation requise.")
+                    else:
+                        st.error("Interaction faible : Molécule peu probable d'agir.")
+                
+                # Avertissement honnête pour le prof/jury
+                st.warning("""
+                ⚠️ **Note Technique :** Le pourcentage ci-dessus est une simulation pour la démo. 
+                Le modèle `.h5` chargé prédit uniquement la structure de l'ARN. 
+                Pour une vraie prédiction, il faudrait entraîner un réseau (ex: Graph Neural Network) prenant en entrée le SMILES et l'Embedding de l'ARN.
+                """)
             else:
-                st.error(f"Impossible de trouver '{name}' dans la base de données PubChem. Vérifiez l'orthographe.")
+                st.error("Veuillez entrer une séquence valide et un nom de médicament correct.")
+
+else:
+    st.info("👈 Chargez d'abord le fichier de poids dans le menu.")

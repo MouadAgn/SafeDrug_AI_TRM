@@ -5,7 +5,7 @@ from data_loader import get_bpRNA_data, RNA_MAP, STRUCT_MAP, MAX_LEN
 from model import TRM_Official
 
 # --- Paramètres Optimisés ---
-D_MODEL = 64
+D_MODEL = 32
 N_SUP = 3       # Deep Supervision steps (réduit un peu pour la vitesse)
 EPOCHS = 5
 BATCH_SIZE = 16 
